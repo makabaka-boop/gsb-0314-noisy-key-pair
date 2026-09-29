@@ -45,8 +45,15 @@ export interface KeyTree {
   root: TreeNode;
   /** 最坏提问数 = 最大根→叶深度（根处提问计数 1） */
   worstDepth: number;
-  /** 所有物种根→叶深度之和 */
+  /**
+   * 路径长度之和。
+   * 普通模式：所有物种根→叶深度之和（每物种恰有一个叶）；
+   * 容错模式：所有“可发生的回答路径”（叶）根→叶深度之和——同一物种
+   * 可能在不同叶处被识别（错误出现在不同问题上）。
+   */
   totalDepth: number;
+  /** 是否按“允许一次观察错误”语义生成（同一特征可在路径上重复提问）。 */
+  allowOneMistake?: boolean;
 }
 
 export interface DistinguishableResult {
@@ -275,16 +282,168 @@ function popcount(x: number): number {
   return (((x + (x >>> 4)) & 0x0f0f0f0f) * 0x01010101) >>> 24;
 }
 
+const MISTAKE_SPECIES_MAX = 6;
+const MISTAKE_FEATURE_MAX = 6;
+
+interface MistakeSubtreeOpt {
+  node: TreeNode;
+  worst: number;
+  total: number;
+  leaves: number;
+}
+
+/**
+ * “允许一次观察错误”模式的记忆化 DP。
+ *
+ * 状态 (exact, loose)：
+ *   - exact 中的物种：迄今每次回答都与其矩阵完全一致（还可容忍一次错误）；
+ *   - loose 中的物种：迄今回答恰有一次与其矩阵不符（错误名额已用完）；
+ *   - 其余物种：不符次数 ≥ 2，已被排除。
+ * exact 与 loose 互不相交。
+ *
+ * 对特征 f 回答“是”（b=1）后：
+ *   exactYes = exact ∩ col[f]，looseYes = (exact ∖ col[f]) ∪ (loose ∩ col[f])；
+ * 回答“否”对称。每个分支的候选都必须非空——否则该回答路径无法收敛，
+ * 该提问非法。同一特征可反复提问；若某分支状态与当前状态完全相同（
+ * 该特征对整个候选集是常数列，回答不改变任何信息），跳过以免零进展。
+ *
+ * 目标（按优先级）：1) 最小化所有可发生回答路径的最坏提问数；
+ * 2) 最小化这些路径总提问数（= 所有叶深度之和）；3) 特征 id 字节序。
+ */
+function solveMistake(input: KeyInput): KeyTree {
+  const n = input.species.length;
+  const m = input.features.length;
+  const fullMask = (1 << n) - 1;
+
+  const colMask = new Array<number>(m).fill(0);
+  for (let s = 0; s < n; s++) {
+    for (let f = 0; f < m; f++) {
+      if (input.matrix[s][f] === 1) colMask[f] |= 1 << s;
+    }
+  }
+
+  const memo = new Map<number, MistakeSubtreeOpt>();
+
+  function stateKey(exact: number, loose: number): number {
+    return exact | (loose << n);
+  }
+
+  function leafFor(mask: number): MistakeSubtreeOpt {
+    const index = 31 - Math.clz32(mask);
+    return {
+      node: { kind: 'leaf', speciesIndex: index, speciesId: input.species[index] },
+      worst: 0,
+      total: 0,
+      leaves: 1,
+    };
+  }
+
+  function dp(exact: number, loose: number): MistakeSubtreeOpt {
+    const alive = exact | loose;
+    if ((alive & (alive - 1)) === 0) {
+      // 唯一候选：该路径必须在此收敛为一个叶
+      return leafFor(alive);
+    }
+    const key = stateKey(exact, loose);
+    const cached = memo.get(key);
+    if (cached !== undefined) return cached;
+
+    let best: MistakeSubtreeOpt | null = null;
+    for (let f = 0; f < m; f++) {
+      const col = colMask[f];
+
+      // 回答“是”：exact 里本有 f 的保持全对；本无 f 的花掉容错名额；
+      // loose 里本有 f 的仍只差一次；本无 f 的差到两次，被淘汰。
+      const exactYes = exact & col;
+      const looseYes = (exact & ~col) | (loose & col);
+      // 回答“否”：对称
+      const exactNo = exact & ~col;
+      const looseNo = (exact & col) | (loose & ~col);
+
+      // 每条可发生的回答路径都必须能继续并最终收敛：两侧候选都不能为空
+      if ((exactYes | looseYes) === 0 || (exactNo | looseNo) === 0) continue;
+      // 零信息分支（常数列）会原地不动，禁止以保证提问数严格下降
+      if (
+        (exactYes === exact && looseYes === loose) ||
+        (exactNo === exact && looseNo === loose)
+      ) {
+        continue;
+      }
+
+      const yesOpt = dp(exactYes, looseYes);
+      const noOpt = dp(exactNo, looseNo);
+      const candidate: MistakeSubtreeOpt = {
+        worst: 1 + Math.max(yesOpt.worst, noOpt.worst),
+        total: yesOpt.total + noOpt.total + yesOpt.leaves + noOpt.leaves,
+        leaves: yesOpt.leaves + noOpt.leaves,
+        node: {
+          kind: 'question',
+          featureIndex: f,
+          featureId: input.features[f],
+          yes: yesOpt.node,
+          no: noOpt.node,
+        },
+      };
+      if (
+        best === null ||
+        candidate.worst < best.worst ||
+        (candidate.worst === best.worst && candidate.total < best.total) ||
+        (candidate.worst === best.worst &&
+          candidate.total === best.total &&
+          compareByteOrder(input.features[f], (best.node as QuestionNode).featureId) < 0)
+      ) {
+        best = candidate;
+      }
+    }
+
+    // 物种向量互异已在调用方保证：对任何非单元素 (exact, loose) 状态，
+    // 总能找到在候选间取值不同的特征形成进展分裂
+    if (best === null) {
+      throw new Error('容错检索表：候选物种集合无法被任何特征进一步分裂');
+    }
+    memo.set(key, best);
+    return best;
+  }
+
+  // 起点：尚未提问，所有物种迄今零次不符
+  const root = dp(fullMask, 0);
+  return {
+    root: root.node,
+    worstDepth: root.worst,
+    totalDepth: root.total,
+    allowOneMistake: true,
+  };
+}
+
 /**
  * 构建检索表。
  * 若存在特征向量完全相同的物种，返回 INDISTINGUISHABLE 与 id 最小的一对，
  * 绝不伪造一棵无法可靠区分的识别树；否则返回最优决策树。
+ *
+ * allowOneMistake 为真时，按“整个回答序列最多一次观察错误”生成容错树
+ * （同一特征可重复提问，每条可发生的回答路径都收敛到唯一物种）；
+ * 该模式最多支持 6 个物种、6 个特征。
  */
 export function buildKey(input: KeyInput): KeyResult {
   validateMatrix(input);
+  if (input.allowOneMistake) {
+    if (input.species.length > MISTAKE_SPECIES_MAX) {
+      throw new Error(
+        `“一次观察错误”模式最多支持 ${MISTAKE_SPECIES_MAX} 个物种（当前 ${input.species.length}）`,
+      );
+    }
+    if (input.features.length > MISTAKE_FEATURE_MAX) {
+      throw new Error(
+        `“一次观察错误”模式最多支持 ${MISTAKE_FEATURE_MAX} 个特征（当前 ${input.features.length}）`,
+      );
+    }
+  }
   const pair = findIndistinguishablePair(input);
   if (pair !== null) {
     return { status: 'INDISTINGUISHABLE', pair };
   }
-  return { status: 'ok', tree: solve(input) };
+  return {
+    status: 'ok',
+    tree: input.allowOneMistake ? solveMistake(input) : solve(input),
+  };
 }

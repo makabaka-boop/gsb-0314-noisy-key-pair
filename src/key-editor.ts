@@ -325,14 +325,23 @@ export class KeyEditor extends LitElement {
     return node;
   }
 
+  /**
+   * 与当前回答记录相容的物种。
+   * 普通模式：每个被问特征都必须与回答一致（重复提问不会发生）。
+   * 容错模式：整个回答序列（同一特征重复提问时按**每次观察**分别计数）
+   * 与物种矩阵至多相差一次是/否回答。
+   */
   private candidateSpecies(): string[] {
     if (!this.result || this.result.status !== 'ok') return [];
     const species = this.currentSpecies();
-    const answerByFeature = new Map<number, 0 | 1>();
-    for (const step of this.path) answerByFeature.set(step.node.featureIndex, step.answer);
+    const tolerance = this.allowOneMistake ? 1 : 0;
     return species.filter((_, s) => {
-      for (const [f, answer] of answerByFeature) {
-        if (this.matrix[s]?.[f] !== answer) return false;
+      let mismatches = 0;
+      for (const step of this.path) {
+        if (this.matrix[s]?.[step.node.featureIndex] !== step.answer) {
+          mismatches++;
+          if (mismatches > tolerance) return false;
+        }
       }
       return true;
     });
@@ -443,7 +452,11 @@ export class KeyEditor extends LitElement {
             `
           : ''}
         <div class="metrics ${this.stale ? 'stale-block' : ''}">
-          最坏提问数：<strong>${tree.worstDepth}</strong>　·　所有物种路径长度之和：<strong>${tree.totalDepth}</strong>
+          最坏提问数：<strong>${tree.worstDepth}</strong>　·　${tree.allowOneMistake
+            ? '所有可发生回答路径的提问数之和'
+            : '所有物种路径长度之和'}：<strong>${tree.totalDepth}</strong>${tree.allowOneMistake
+            ? '　·　容错：整个回答序列最多一次观察错误（同一特征可重复核对）'
+            : ''}
         </div>
         <div class="tree ${this.stale ? 'stale-block' : ''}">${this.renderTree(tree.root)}</div>
         ${this.stale ? '' : this.renderIdentify()}
