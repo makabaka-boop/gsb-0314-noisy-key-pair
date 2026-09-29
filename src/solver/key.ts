@@ -45,8 +45,10 @@ export interface KeyTree {
   root: TreeNode;
   /** 最坏提问数 = 最大根→叶深度（根处提问计数 1） */
   worstDepth: number;
-  /** 所有物种根→叶深度之和 */
+  /** 普通模式：所有物种根→叶深度之和；容错模式：所有可发生回答路径（叶）的提问数之和 */
   totalDepth: number;
+  /** 是否按“允许一次观察错误”生成（同一特征可在一条路径上重复提问） */
+  allowOneMistake: boolean;
 }
 
 export interface DistinguishableResult {
@@ -66,6 +68,8 @@ const SPECIES_MIN = 3;
 const SPECIES_MAX = 16;
 const FEATURE_MIN = 2;
 const FEATURE_MAX = 16;
+/** “允许一次观察错误”模式最多支持 6 个物种、6 个特征 */
+const MISTAKE_MODE_LIMIT = 6;
 
 /**
  * 按 ASCII 字节序比较两个字符串。
@@ -266,7 +270,146 @@ function solve(input: KeyInput): KeyTree {
   }
 
   const root = dp(fullMask);
-  return { root: root.node, worstDepth: root.worst, totalDepth: root.total };
+  return { root: root.node, worstDepth: root.worst, totalDepth: root.total, allowOneMistake: false };
+}
+
+/**
+ * 容错模式求解（整个回答序列中至多一次是/否与真实物种矩阵不符）。
+ *
+ * 状态不是单一候选物种集合，而是两个集合：
+ *   - S0：与迄今全部回答都相符的物种（发生过 0 次不符）；
+ *   - S1：与迄今回答恰好一处不符的物种（发生过 1 次不符，后续必须全相符）。
+ * 对特征 f 回答“是”时：
+ *   S0 中具备 f 者、S1 中具备 f 者回答相符，留在各自集合；
+ *   S0 中不具备 f 者用掉唯一的容错额度，落入新 S1；
+ *   S1 中不具备 f 者将出现第二次不符，永久淘汰。
+ * 回答“否”对称。
+ *
+ * 终态：|S0 ∪ S1| ≤ 1 时出叶（0 个表示该回答序列对任何真实物种都需 ≥2
+ * 次错误，不可能发生；1 个即唯一候选）。同一特征允许重复提问。
+ * 只考虑能真正分裂当前候选并集的特征（f 在候选中 0、1 取值都存在）：
+ * 取值恒定的提问有一侧状态与现状完全相同，毫无信息，绝不可能最优；
+ * 跳过它也保证递归终止——每次转移都有物种沿 S0→S1→淘汰 单调移动。
+ *
+ * 指标只统计可发生的回答路径：
+ *   1. 最小化最坏提问数（可发生叶的最大深度）；
+ *   2. 最小化这些路径的提问数之和（每条根→叶回答序列算一条）；
+ *   3. 特征 id 字节序裁决。
+ *
+ * 每个物种在状态中三选一（S0 / S1 / 淘汰），状态数不超过 3^n，
+ * n ≤ 6 时极小，用 ((S1 << n) | S0) 编码记忆化。
+ */
+function solveOneMistake(input: KeyInput): KeyTree {
+  const n = input.species.length;
+  const m = input.features.length;
+  const fullMask = (1 << n) - 1;
+
+  // colMask[f]: 具备特征 f 的物种集合
+  const colMask = new Array<number>(m).fill(0);
+  for (let s = 0; s < n; s++) {
+    for (let f = 0; f < m; f++) {
+      if (input.matrix[s][f] === 1) colMask[f] |= 1 << s;
+    }
+  }
+
+  interface MistakeOpt {
+    node: TreeNode;
+    /** 从该状态出发，沿每条可发生回答路径的最坏追加提问数 */
+    worst: number;
+    /** 从该状态出发，各可发生叶的追加提问数之和 */
+    total: number;
+    /** 从该状态出发的可发生叶（回答序列）数 */
+    paths: number;
+  }
+
+  const memo = new Map<number, MistakeOpt>();
+
+  function dp(s0: number, s1: number): MistakeOpt {
+    const union = s0 | s1;
+    if ((union & (union - 1)) === 0) {
+      // union===0：任何真实物种都需 ≥2 次错误才能走出这条回答序列，
+      // 属于不可能路径；只对真正分裂候选的提问递归，正常树中不会到达，
+      // 这里给一个不参与指标的防御性叶节点。
+      if (union === 0) {
+        return {
+          node: { kind: 'leaf', speciesIndex: 0, speciesId: input.species[0] },
+          worst: 0,
+          total: 0,
+          paths: 0,
+        };
+      }
+      // 唯一候选：可发生路径收敛到该物种
+      const index = 31 - Math.clz32(union);
+      return {
+        node: { kind: 'leaf', speciesIndex: index, speciesId: input.species[index] },
+        worst: 0,
+        total: 0,
+        paths: 1,
+      };
+    }
+
+    const key = (s1 << n) | s0;
+    const cached = memo.get(key);
+    if (cached !== undefined) return cached;
+
+    let best: MistakeOpt | null = null;
+    for (let f = 0; f < m; f++) {
+      const has = colMask[f];
+      // f 必须在当前候选中同时取到 0 和 1，否则该问无信息（一侧状态不变）
+      if ((union & has) === 0 || (union & ~has) === 0) continue;
+
+      // 回答“是”：相符者（具备 f）留在原集合；S0 中不具备 f 者用掉额度进入 S1
+      const yes0 = s0 & has;
+      const yes1 = (s1 & has) | (s0 & ~has);
+      // 回答“否”：相符者（不具备 f）留在原集合；S0 中具备 f 者用掉额度进入 S1
+      const no0 = s0 & ~has;
+      const no1 = (s1 & ~has) | (s0 & has);
+
+      const yesOpt = dp(yes0, yes1);
+      const noOpt = dp(no0, no1);
+
+      // 每条进入该状态的回答历史在本节点多问一次：
+      // 路径数 = 两侧可发生叶数之和；提问数 = 两侧追加和 + 每条路径本层的 1 次
+      const paths = yesOpt.paths + noOpt.paths;
+      const candidate: MistakeOpt = {
+        worst: 1 + Math.max(yesOpt.worst, noOpt.worst),
+        total: yesOpt.total + noOpt.total + paths,
+        paths,
+        node: {
+          kind: 'question',
+          featureIndex: f,
+          featureId: input.features[f],
+          yes: yesOpt.node,
+          no: noOpt.node,
+        },
+      };
+      if (
+        best === null ||
+        candidate.worst < best.worst ||
+        (candidate.worst === best.worst && candidate.total < best.total) ||
+        (candidate.worst === best.worst &&
+          candidate.total === best.total &&
+          compareByteOrder(input.features[f], (best.node as QuestionNode).featureId) < 0)
+      ) {
+        best = candidate;
+      }
+    }
+
+    // 物种向量互异时容错树必然存在（对普通树的每个问题问三遍、按多数回答走即可）
+    if (best === null) {
+      throw new Error('容错状态下不存在能继续分裂候选的特征');
+    }
+    memo.set(key, best);
+    return best;
+  }
+
+  const root = dp(fullMask, 0);
+  return {
+    root: root.node,
+    worstDepth: root.worst,
+    totalDepth: root.total,
+    allowOneMistake: true,
+  };
 }
 
 function popcount(x: number): number {
@@ -279,12 +422,30 @@ function popcount(x: number): number {
  * 构建检索表。
  * 若存在特征向量完全相同的物种，返回 INDISTINGUISHABLE 与 id 最小的一对，
  * 绝不伪造一棵无法可靠区分的识别树；否则返回最优决策树。
+ *
+ * allowOneMistake 为真时生成容忍一次是/否观察错误的决策树（同一特征
+ * 可重复提问），该模式最多支持 6 个物种、6 个特征。
  */
 export function buildKey(input: KeyInput): KeyResult {
   validateMatrix(input);
+  if (input.allowOneMistake) {
+    if (input.species.length > MISTAKE_MODE_LIMIT) {
+      throw new Error(
+        `“允许一次观察错误”模式最多支持 ${MISTAKE_MODE_LIMIT} 个物种（当前 ${input.species.length}）`,
+      );
+    }
+    if (input.features.length > MISTAKE_MODE_LIMIT) {
+      throw new Error(
+        `“允许一次观察错误”模式最多支持 ${MISTAKE_MODE_LIMIT} 个特征（当前 ${input.features.length}）`,
+      );
+    }
+  }
   const pair = findIndistinguishablePair(input);
   if (pair !== null) {
     return { status: 'INDISTINGUISHABLE', pair };
   }
-  return { status: 'ok', tree: solve(input) };
+  return {
+    status: 'ok',
+    tree: input.allowOneMistake ? solveOneMistake(input) : solve(input),
+  };
 }

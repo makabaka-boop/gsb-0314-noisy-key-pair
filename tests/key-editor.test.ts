@@ -195,4 +195,133 @@ describe('key-editor 组件交互', () => {
     expect(host.shadowRoot!.querySelector('.indist')).toBeNull();
     expect(host.shadowRoot!.querySelectorAll('.lnode')).toHaveLength(4);
   });
+
+  async function enableMistakeMode(): Promise<void> {
+    const checkbox = host.shadowRoot!.querySelector(
+      'input[type="checkbox"]',
+    ) as HTMLInputElement;
+    checkbox.checked = true;
+    checkbox.dispatchEvent(new Event('change', { bubbles: true }));
+    await settled();
+    clickButton(host.shadowRoot!, '生成检索表');
+    await settled();
+  }
+
+  const ask = () => text(host.shadowRoot!.querySelector('.identify .ask'));
+  const candidates = () => text(host.shadowRoot!.querySelector('.candidates'));
+  const leafResult = () => text(host.shadowRoot!.querySelector('.result-leaf'));
+
+  it('容错模式：生成容错树、指标切换，且同一特征被重复提问', async () => {
+    await settled();
+    await enableMistakeMode();
+
+    const card = host.shadowRoot!.querySelectorAll('section.card')[1];
+    // 默认 4×2 容错树：最坏 5 问，8 条可发生路径，提问总和 88
+    expect(text(card)).toContain('最坏提问数：5');
+    expect(text(card)).toContain('提问数之和：88');
+    expect(text(card)).toContain('容错模式');
+    // 根仍先问 flying
+    expect(ask()).toBe('flying?');
+    // 尚未作答时四个物种都在候选中
+    expect(candidates()).toContain('当前候选物种（4）');
+  });
+
+  it('容错模式：第一问答错后真实物种仍保留，重复核对后正确识别', async () => {
+    await settled();
+    await enableMistakeMode();
+
+    // 真实物种是 cat=(flying0, furry1)，但第一问 flying 错答“是”
+    clickButton(host.shadowRoot!, '是（具备）');
+    await settled();
+    // 容错候选：与一条回答至多一处不符——四个物种全部保留
+    expect(candidates()).toContain('当前候选物种（4）');
+    expect(candidates()).toContain('cat');
+    // 容错树立即重复提问 flying 核对
+    expect(ask()).toBe('flying?');
+
+    // 第二次如实答“否”。回答记录 flying=是、flying=否：
+    // 每个物种都恰好与其中一条不符（1 次），故四个物种仍全部保留
+    clickButton(host.shadowRoot!, '否（不具备）');
+    await settled();
+    expect(candidates()).toContain('当前候选物种（4）');
+    expect(candidates()).toContain('cat');
+    // 接下来的提问只要如实作答，最终必须识别为 cat
+    for (let guard = 0; guard < 8; guard++) {
+      const qText = ask();
+      if (!qText) break;
+      const truth = qText === 'flying?' ? 0 : 1; // cat: flying0 furry1
+      clickButton(host.shadowRoot!, truth === 1 ? '是（具备）' : '否（不具备）');
+      await settled();
+    }
+    expect(leafResult()).toBe('识别结果：cat');
+    // 收敛到叶后候选与叶节点一致
+    expect(candidates()).toContain('当前候选物种（1）');
+    expect(candidates()).toContain('cat');
+  });
+
+  it('容错模式：回溯到较早一问并改选后，候选与叶结论随回答记录更新', async () => {
+    await settled();
+    await enableMistakeMode();
+
+    // 默认矩阵：ant=0,(0,0) bat=(1,1) bee=(1,0) cat=(0,1)
+    const matrix = [
+      [0, 0],
+      [1, 1],
+      [1, 0],
+      [0, 1],
+    ];
+    const answerTruthfully = (species: number): void => {
+      const qText = ask();
+      const fIdx = qText === 'flying?' ? 0 : 1;
+      const v = matrix[species][fIdx];
+      clickButton(host.shadowRoot!, v === 1 ? '是（具备）' : '否（不具备）');
+    };
+
+    // 先如实识别 ant
+    for (let guard = 0; guard < 8; guard++) {
+      if (!ask()) break;
+      answerTruthfully(0);
+      await settled();
+    }
+    expect(leafResult()).toBe('识别结果：ant');
+
+    // 回溯到第一问（第一条历史），改走另一条分支后如实识别 cat
+    const backButtons = host.shadowRoot!.querySelectorAll('.history button');
+    (backButtons[0] as HTMLButtonElement).click();
+    await settled();
+    expect(ask()).toBe('flying?');
+    expect(candidates()).toContain('当前候选物种（4）');
+
+    for (let guard = 0; guard < 8; guard++) {
+      if (!ask()) break;
+      answerTruthfully(3); // cat
+      await settled();
+    }
+    expect(leafResult()).toBe('识别结果：cat');
+    expect(candidates()).toContain('cat');
+    expect(candidates()).not.toContain('ant');
+  });
+
+  it('关闭容错选项并重新生成后恢复普通树（最坏 2，总和 8）', async () => {
+    await settled();
+    await enableMistakeMode();
+    expect(text(host.shadowRoot!.querySelectorAll('section.card')[1])).toContain('最坏提问数：5');
+
+    const checkbox = host.shadowRoot!.querySelector(
+      'input[type="checkbox"]',
+    ) as HTMLInputElement;
+    checkbox.checked = false;
+    checkbox.dispatchEvent(new Event('change', { bubbles: true }));
+    await settled();
+    clickButton(host.shadowRoot!, '生成检索表');
+    await settled();
+
+    const card = host.shadowRoot!.querySelectorAll('section.card')[1];
+    expect(text(card)).toContain('最坏提问数：2');
+    expect(text(card)).toContain('路径长度之和：8');
+    // 普通模式下第一问答错应立即淘汰真实物种（cat 对 flying 实答应为否）
+    clickButton(host.shadowRoot!, '是（具备）');
+    await settled();
+    expect(candidates()).not.toContain('cat');
+  });
 });

@@ -243,6 +243,9 @@ export class KeyEditor extends LitElement {
   @state() private error: string | null = null;
   @state() private path: AnswerStep[] = [];
   @state() private allowOneMistake = false;
+  /** 生成当前树时使用的快照；候选计算以此为准，避免编辑中矩阵污染识别过程 */
+  @state() private builtSpecies: string[] = [];
+  @state() private builtMatrix: number[][] = [];
 
   private currentSpecies(): string[] {
     return this.speciesText
@@ -305,6 +308,8 @@ export class KeyEditor extends LitElement {
         row.slice(0, features.length),
       );
       this.result = buildKey({ species, features, matrix, allowOneMistake: this.allowOneMistake });
+      this.builtSpecies = species;
+      this.builtMatrix = matrix.map((row) => [...row]);
       this.stale = false;
       this.error = null;
       this.path = [];
@@ -325,14 +330,23 @@ export class KeyEditor extends LitElement {
     return node;
   }
 
+  /**
+   * 当前回答记录下的候选物种。
+   * - 普通模式：物种必须与每一问的回答逐特征相符；
+   * - 容错模式：保留与整条回答序列至多一处不符的物种，
+   *   同一特征被重复提问时每次回答分别计数（不能用 Map 覆盖旧回答）。
+   * 一律以生成树时的矩阵快照为准。
+   */
   private candidateSpecies(): string[] {
     if (!this.result || this.result.status !== 'ok') return [];
-    const species = this.currentSpecies();
-    const answerByFeature = new Map<number, 0 | 1>();
-    for (const step of this.path) answerByFeature.set(step.node.featureIndex, step.answer);
-    return species.filter((_, s) => {
-      for (const [f, answer] of answerByFeature) {
-        if (this.matrix[s]?.[f] !== answer) return false;
+    const tolerate = this.result.tree.allowOneMistake;
+    return this.builtSpecies.filter((_, s) => {
+      let mismatches = 0;
+      for (const step of this.path) {
+        if (this.builtMatrix[s]?.[step.node.featureIndex] !== step.answer) {
+          mismatches++;
+          if (!tolerate || mismatches > 1) return false;
+        }
       }
       return true;
     });
@@ -434,6 +448,7 @@ export class KeyEditor extends LitElement {
 
     if (this.result?.status === 'ok') {
       const { tree } = this.result;
+      const tolerate = tree.allowOneMistake;
       return html`
         ${this.stale
           ? html`
@@ -443,7 +458,14 @@ export class KeyEditor extends LitElement {
             `
           : ''}
         <div class="metrics ${this.stale ? 'stale-block' : ''}">
-          最坏提问数：<strong>${tree.worstDepth}</strong>　·　所有物种路径长度之和：<strong>${tree.totalDepth}</strong>
+          ${tolerate
+            ? html`
+                最坏提问数：<strong>${tree.worstDepth}</strong>　·　所有可发生回答路径提问数之和：<strong>${tree.totalDepth}</strong>
+                <br />容错模式：允许整个回答序列中至多一次是/否观察错误，同一特征可能重复提问。
+              `
+            : html`
+                最坏提问数：<strong>${tree.worstDepth}</strong>　·　所有物种路径长度之和：<strong>${tree.totalDepth}</strong>
+              `}
         </div>
         <div class="tree ${this.stale ? 'stale-block' : ''}">${this.renderTree(tree.root)}</div>
         ${this.stale ? '' : this.renderIdentify()}
@@ -459,9 +481,14 @@ export class KeyEditor extends LitElement {
 
   private renderIdentify(): TemplateResult {
     const node = this.currentNode();
+    const tolerate = this.result?.status === 'ok' && this.result.tree.allowOneMistake;
+    const candidates = this.candidateSpecies();
     return html`
       <div class="identify">
         <h2 style="margin-bottom:0.2rem">实际识别</h2>
+        ${tolerate
+          ? html`<p class="hint" style="margin:0 0 0.4rem">容错识别中：候选保留与回答记录至多一处不符的物种；必要时同一特征会被重复提问核对。</p>`
+          : ''}
         ${this.path.length > 0
           ? html`
               <ul class="history">
@@ -501,12 +528,16 @@ export class KeyEditor extends LitElement {
                     : ''}
                 </div>
                 <p class="candidates">
-                  当前候选物种（${this.candidateSpecies().length}）：
-                  ${this.candidateSpecies().join(', ')}
+                  当前候选物种（${candidates.length}）：
+                  ${candidates.join(', ')}
                 </p>
               `
             : html`
                 <p class="result-leaf">识别结果：${(node as LeafNode).speciesId}</p>
+                <p class="candidates">
+                  当前候选物种（${candidates.length}）：
+                  ${candidates.join(', ')}
+                </p>
                 <div class="answer-row">
                   <button class="secondary" @click=${() => this.restartIdentification()}>
                     重新识别

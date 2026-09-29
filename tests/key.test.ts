@@ -91,7 +91,7 @@ function bruteSolve(input: KeyInput): KeyTree {
   }
   const full = (1 << input.species.length) - 1;
   const r = bruteOptimal(input, full, colMasks, new Map());
-  return { root: r.node, worstDepth: r.worst, totalDepth: r.total };
+  return { root: r.node, worstDepth: r.worst, totalDepth: r.total, allowOneMistake: false };
 }
 
 /* ------------------------------------------------------------------ */
@@ -505,5 +505,336 @@ describe('随机矩阵对拍', () => {
     const input = makeInput(16, 16, rows);
     const tree = expectTree(buildKey(input));
     expect(statsByWalking(input, tree)).toEqual([4, 64]);
+  });
+});
+
+/* ================================================================== */
+/* “允许一次观察错误”模式                                              */
+/* ================================================================== */
+
+/**
+ * 独立的容错参考求解器：与生产代码不同的状态键编码（36 进制字符串）与
+ * 候选收集方式（数组 + 排序三元比较），状态语义同为 (S0, S1)。
+ */
+function bruteMistakeSolve(input: KeyInput): KeyTree {
+  const n = input.species.length;
+  const m = input.features.length;
+  const full = (1 << n) - 1;
+  const col = new Array<number>(m).fill(0);
+  for (let s = 0; s < n; s++) {
+    for (let f = 0; f < m; f++) if (input.matrix[s][f]) col[f] |= 1 << s;
+  }
+
+  interface O {
+    node: TreeNode;
+    worst: number;
+    total: number;
+    paths: number;
+  }
+  const memo = new Map<string, O>();
+
+  const leaf = (union: number): O => {
+    if (union === 0) {
+      return {
+        node: { kind: 'leaf', speciesIndex: 0, speciesId: input.species[0] },
+        worst: 0,
+        total: 0,
+        paths: 0,
+      };
+    }
+    const index = 31 - Math.clz32(union);
+    return {
+      node: { kind: 'leaf', speciesIndex: index, speciesId: input.species[index] },
+      worst: 0,
+      total: 0,
+      paths: 1,
+    };
+  };
+
+  const dp = (s0: number, s1: number): O => {
+    const union = s0 | s1;
+    if ((union & (union - 1)) === 0) return leaf(union);
+    const key = `${s0.toString(36)}|${s1.toString(36)}`;
+    const hit = memo.get(key);
+    if (hit) return hit;
+
+    const cands: Array<O & { fid: string }> = [];
+    for (let f = 0; f < m; f++) {
+      const has = col[f];
+      if ((union & has) === 0 || (union & ~has) === 0) continue;
+      const y = dp(s0 & has, (s1 & has) | (s0 & ~has));
+      const no = dp(s0 & ~has, (s1 & ~has) | (s0 & has));
+      const paths = y.paths + no.paths;
+      cands.push({
+        fid: input.features[f],
+        node: {
+          kind: 'question',
+          featureIndex: f,
+          featureId: input.features[f],
+          yes: y.node,
+          no: no.node,
+        },
+        worst: 1 + Math.max(y.worst, no.worst),
+        total: y.total + no.total + paths,
+        paths,
+      });
+    }
+    if (cands.length === 0) throw new Error('brute mistake: unsplittable state');
+    cands.sort(
+      (a, b) =>
+        a.worst - b.worst ||
+        a.total - b.total ||
+        compareByteOrder(a.fid, b.fid),
+    );
+    const winner = cands[0];
+    memo.set(key, winner);
+    return winner;
+  };
+
+  const r = dp(full, 0);
+  return { root: r.node, worstDepth: r.worst, totalDepth: r.total, allowOneMistake: true };
+}
+
+/**
+ * 容错树独立语义校验（不信任求解器自己的指标）：
+ *  1. 枚举树的每条根→叶回答路径，计算它对每个物种的不符次数；
+ *     对某物种 ≤1 即该物种可能走到此叶——这样的物种必须恰好一个，且叶标签是它；
+ *  2. 独立模拟每个物种“无错”及“恰好在第 j 次提问处答错”的实际行走
+ *     （后续提问以实际走到的节点为准，因为同一特征会被重复提问），
+ *     终点必须都是该物种自身；
+ *  3. 由行走结果独立统计最坏提问数与可发生路径提问数之和，核对树自带指标。
+ * 返回 [可发生叶数, 最坏深度, 总深度]。
+ */
+function verifyMistakeTree(input: KeyInput, tree: KeyTree): [number, number, number] {
+  interface PathLeaf {
+    leaf: LeafNode;
+    depth: number;
+    answers: { f: number; a: 0 | 1 }[];
+  }
+  const allLeaves: PathLeaf[] = [];
+  const enumerate = (node: TreeNode, answers: { f: number; a: 0 | 1 }[], depth: number): void => {
+    if (node.kind === 'leaf') {
+      allLeaves.push({ leaf: node, depth, answers });
+      return;
+    }
+    enumerate(node.yes, [...answers, { f: node.featureIndex, a: 1 }], depth + 1);
+    enumerate(node.no, [...answers, { f: node.featureIndex, a: 0 }], depth + 1);
+  };
+  enumerate(tree.root, [], 0);
+
+  const realizable = new Set<LeafNode>();
+  for (const pl of allLeaves) {
+    const compatible: number[] = [];
+    for (let s = 0; s < input.species.length; s++) {
+      let mis = 0;
+      for (const ans of pl.answers) {
+        if (input.matrix[s][ans.f] !== ans.a) mis++;
+      }
+      if (mis <= 1) compatible.push(s);
+    }
+    expect(compatible.length, `一条叶路径同时可由 ${compatible.length} 个物种 ≤1 错到达`).toBeLessThanOrEqual(1);
+    if (compatible.length === 1) {
+      realizable.add(pl.leaf);
+      expect(pl.leaf.speciesIndex).toBe(compatible[0]);
+    }
+  }
+  // 每个叶标签在树上可以共享（DAG 记忆化）；只要求可发生叶都标注正确物种
+  expect(realizable.size).toBeGreaterThan(0);
+
+  const walk = (speciesIndex: number, lieAtAsk: number): { leaf: LeafNode; questions: number } => {
+    let node: TreeNode = tree.root;
+    let asked = 0;
+    while (node.kind === 'question') {
+      const truth = input.matrix[speciesIndex][node.featureIndex] as 0 | 1;
+      const a = asked === lieAtAsk ? ((truth ^ 1) as 0 | 1) : truth;
+      node = a === 1 ? node.yes : node.no;
+      asked++;
+      if (asked > 64) throw new Error('容错树疑似存在环（超过 64 问未出叶）');
+    }
+    return { leaf: node, questions: asked };
+  };
+
+  const depths: number[] = [];
+  for (let s = 0; s < input.species.length; s++) {
+    const honest = walk(s, -1);
+    expect(honest.leaf.speciesIndex).toBe(s);
+    depths.push(honest.questions);
+    // 在诚实路径的每个提问位置各引入一次错误
+    for (let j = 0; j < honest.questions; j++) {
+      const lied = walk(s, j);
+      expect(lied.leaf.speciesIndex, `物种 ${input.species[s]} 第 ${j} 问答错后被误判`).toBe(s);
+      depths.push(lied.questions);
+    }
+  }
+
+  // 从叶路径独立汇总：可发生叶的最大深度与深度之和
+  let worst = 0;
+  let total = 0;
+  for (const pl of allLeaves) {
+    if (realizable.has(pl.leaf)) {
+      worst = Math.max(worst, pl.depth);
+      total += pl.depth;
+    }
+  }
+  expect(worst).toBe(Math.max(...depths));
+  expect(worst).toBe(tree.worstDepth);
+  expect(total).toBe(tree.totalDepth);
+  return [realizable.size, worst, total];
+}
+
+describe('允许一次观察错误：求解器', () => {
+  it('默认 4×2 矩阵：生成容错树且标记 allowOneMistake', () => {
+    const input: KeyInput = {
+      species: ['ant', 'bat', 'bee', 'cat'],
+      features: ['flying', 'furry'],
+      matrix: [
+        [0, 0],
+        [1, 1],
+        [1, 0],
+        [0, 1],
+      ],
+      allowOneMistake: true,
+    };
+    const result = buildKey(input);
+    expect(result.status).toBe('ok');
+    const tree = (result as { status: 'ok'; tree: KeyTree }).tree;
+    expect(tree.allowOneMistake).toBe(true);
+    const [paths, worst, total] = verifyMistakeTree(input, tree);
+    expect(worst).toBe(5);
+    expect(paths).toBe(8);
+    expect(total).toBe(88);
+
+    // 根问题仍是字节序最小的 flying；容错树必须重复提问同一特征
+    expect(q(tree.root).featureId).toBe('flying');
+    const featuresSeen: string[] = [];
+    const collect = (node: TreeNode): void => {
+      if (node.kind === 'leaf') return;
+      featuresSeen.push(node.featureId);
+      collect(node.yes);
+      collect(node.no);
+    };
+    collect(tree.root);
+    expect(featuresSeen.filter((id) => id === 'flying').length).toBeGreaterThan(1);
+  });
+
+  it('与独立参考 DP 对拍：默认矩阵结构、最坏、总和完全一致', () => {
+    const input: KeyInput = {
+      species: ['ant', 'bat', 'bee', 'cat'],
+      features: ['flying', 'furry'],
+      matrix: [
+        [0, 0],
+        [1, 1],
+        [1, 0],
+        [0, 1],
+      ],
+      allowOneMistake: true,
+    };
+    const tree = expectTree(buildKey(input));
+    const ref = bruteMistakeSolve(input);
+    expect(tree.worstDepth).toBe(ref.worstDepth);
+    expect(tree.totalDepth).toBe(ref.totalDepth);
+    expect(structureOf(tree.root)).toEqual(structureOf(ref.root));
+  });
+
+  function exhaustMistake(n: number, m: number): void {
+    const total = 1 << (n * m);
+    let checked = 0;
+    for (let bits = 0; bits < total; bits++) {
+      const rows: number[][] = [];
+      for (let s = 0; s < n; s++) {
+        const row: number[] = [];
+        for (let f = 0; f < m; f++) row.push((bits >> (s * m + f)) & 1);
+        rows.push(row);
+      }
+      if (new Set(rows.map((r) => r.join(''))).size !== n) continue; // 互异矩阵才出树
+      const input = { ...makeInput(n, m, rows), allowOneMistake: true };
+      const tree = expectTree(buildKey(input));
+      verifyMistakeTree(input, tree);
+      const ref = bruteMistakeSolve(input);
+      expect(tree.worstDepth).toBe(ref.worstDepth);
+      expect(tree.totalDepth).toBe(ref.totalDepth);
+      expect(structureOf(tree.root)).toEqual(structureOf(ref.root));
+      checked++;
+    }
+    expect(checked).toBeGreaterThan(0);
+  }
+
+  it('4×2：全部互异矩阵穷举对拍（64 矩阵空间）', () => {
+    exhaustMistake(4, 2);
+  });
+
+  it('3×3：全部互异矩阵穷举对拍（512 矩阵空间）', () => {
+    exhaustMistake(3, 3);
+  });
+
+  it('4×3：全部互异矩阵穷举对拍（4096 矩阵空间）', () => {
+    exhaustMistake(4, 3);
+  });
+
+  it('普通模式不受影响：不带容错标记时树与普通求解一致', () => {
+    const input = makeInput(4, 2, [
+      [0, 0],
+      [0, 1],
+      [1, 0],
+      [1, 1],
+    ]);
+    const tree = expectTree(buildKey(input));
+    expect(tree.allowOneMistake).toBe(false);
+    expect(tree.worstDepth).toBe(2);
+  });
+
+  it('同向量物种在容错模式下仍返回 INDISTINGUISHABLE，绝不伪造容错树', () => {
+    const input: KeyInput = {
+      ...makeInput(3, 2, [
+        [0, 1],
+        [0, 1],
+        [1, 0],
+      ]),
+      allowOneMistake: true,
+    };
+    const result = buildKey(input);
+    expect(result.status).toBe('INDISTINGUISHABLE');
+  });
+
+  it('超过 6 个物种或 6 个特征时报错', () => {
+    const sevenSpecies: KeyInput = {
+      species: ['a', 'b', 'c', 'd', 'e', 'f', 'g'],
+      features: ['p', 'q'],
+      matrix: [
+        [0, 0], [0, 1], [1, 0], [1, 1],
+        [0, 0], [0, 1], [1, 0],
+      ],
+      allowOneMistake: true,
+    };
+    expect(() => buildKey(sevenSpecies)).toThrow(/最多支持 6 个物种/);
+
+    const sevenFeatures: KeyInput = {
+      species: ['a', 'b', 'c'],
+      features: ['p', 'q', 'r', 's', 't', 'u', 'v'],
+      matrix: [
+        [0, 0, 0, 0, 0, 0, 0],
+        [1, 1, 1, 1, 1, 1, 1],
+        [0, 1, 0, 1, 0, 1, 0],
+      ],
+      allowOneMistake: true,
+    };
+    expect(() => buildKey(sevenFeatures)).toThrow(/最多支持 6 个特征/);
+  });
+
+  it('6×6 互异矩阵冒烟：容错树语义合法且有限', () => {
+    const input: KeyInput = {
+      ...makeInput(6, 6, [
+        [0, 0, 0, 0, 0, 0],
+        [0, 0, 0, 0, 0, 1],
+        [0, 0, 0, 0, 1, 0],
+        [0, 0, 0, 1, 0, 0],
+        [0, 0, 1, 0, 0, 0],
+        [0, 1, 0, 0, 0, 0],
+      ]),
+      allowOneMistake: true,
+    };
+    const tree = expectTree(buildKey(input));
+    const [, worst] = verifyMistakeTree(input, tree);
+    expect(worst).toBeGreaterThanOrEqual(3);
   });
 });
